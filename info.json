@@ -1,0 +1,13 @@
+{
+  "name": "space-taxi",
+  "version": "0.2.2",
+  "title": "Space Taxi",
+  "author": "cheesy",
+  "factorio_version": "2.1",
+  "dependencies": [
+    "base >= 2.1",
+    "space-age"
+  ],
+  "description": "Book a ride on a space platform that is not in orbit yet, or just pick a destination planet: the mod waits for the most direct ship, launches you when it arrives, holds the ship until you are aboard and lands you at the destination. Ships can be opened or closed for passengers in the hub window.",
+  "homepage": "https://github.com/cheesy304/space-taxi"
+}

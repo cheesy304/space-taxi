@@ -1,0 +1,24 @@
+---------------------------------------------------------------------------------------------------
+Version: 0.2.2
+Date: 2026-11-20
+  Graphics:
+    - Added a thumbnail.
+---------------------------------------------------------------------------------------------------
+Version: 0.2.1
+Date: 2026-11-20
+  Bugfixes:
+    - Fixed a crash when choosing a destination planet.
+---------------------------------------------------------------------------------------------------
+Version: 0.2.0
+Date: 2026-11-20
+  Features:
+    - Booking a ride seats you in the rocket of the nearest silo while you wait; that silo is paused so it cannot send the rocket elsewhere.
+  Changes:
+    - Removed chat messages; all information is shown in the status line.
+  Bugfixes:
+    - Fixed the stop count for ships flying towards your planet.
+---------------------------------------------------------------------------------------------------
+Version: 0.1.0
+Date: 2026-11-20
+  Features:
+    - Initial release: wait for any ship in automatic mode, or pick a destination planet and ride the most direct ship, with automatic landing and a Passengers checkbox in the hub window.
