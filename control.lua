@@ -10,14 +10,42 @@ local STATUS = "space-taxi-status"
 local HUB_FRAME = "space-taxi-hub"
 local SILO_FRAME = "space-taxi-silo"
 
+local BOARD_TICKS = 40 * 60      -- rocket flight from the silo to the ship, plus a margin
+local UNKNOWN_WAIT = 60 * 60     -- guess for a stop that waits for items/signals and was never observed
+local SWITCH_MARGIN = 15 * 60    -- a destination booking moves to another ship only if it is this much faster
+local DEFAULT_KM_PER_TICK = 100 / 60
+
 local function init_storage()
   storage.passengers = storage.passengers or {}
   storage.bookings = storage.bookings or {}
   storage.holds = storage.holds or {}
   storage.silos = storage.silos or {} -- [silo unit number] = player index holding its rocket
+  -- storage.stats[platform index] = {dwell = {[record key] = {avg, n, max}}, leg = {[from \0 to] = {avg, n}},
+  --   kmpt (learned km per tick), at_key, at_name, at_tick, tainted, left_from, left_tick}
+  storage.stats = storage.stats or {}
 end
+local busy = {} -- players whose booking is being processed (pausing a ship raises events right away)
+
+-- versions before 0.3.1 could leave a silo switched off after an interrupted launch: switch those back on
+local function unfreeze_silos()
+  local owned = {}
+  for _, b in pairs(storage.bookings) do if b.silo and b.silo.valid then owned[b.silo.unit_number] = true end end
+  for _, s in pairs(game.surfaces) do
+    for _, silo in pairs(s.find_entities_filtered { type = "rocket-silo" }) do
+      if silo.disabled_by_script and not owned[silo.unit_number] then
+        silo.disabled_by_script = false
+        storage.silos[silo.unit_number] = nil
+      end
+    end
+  end
+end
+
 script.on_init(init_storage)
-script.on_configuration_changed(init_storage)
+script.on_configuration_changed(function(e)
+  init_storage()
+  local c = e.mod_changes and e.mod_changes["space-taxi"]
+  if c and c.old_version and helpers.compare_versions(c.old_version, "0.3.1") < 0 then unfreeze_silos() end
+end)
 
 ---------------------------------------------------------------- helpers
 
@@ -42,7 +70,10 @@ local function accepts_passengers(p)
 end
 
 local function is_auto(p)
-  return p and p.valid and not p.paused and p.hub and p.hub.valid and (p.scheduled_for_deletion or 0) == 0
+  if not (p and p.valid and p.hub and p.hub.valid and (p.scheduled_for_deletion or 0) == 0) then return false end
+  if not p.paused then return true end
+  local h = storage.holds[p.index] -- paused by Space Taxi for a passenger: still in automatic mode
+  return h ~= nil and h.we_paused
 end
 
 -- stop names of the schedule, in order, and the index of the current record
@@ -86,59 +117,219 @@ local function distance(a, b)
   return r
 end
 
--- how many stops until the ship stops at `here` (0 = it is stopped there now)
--- the current record is the stop the ship is at, or the one it is flying to
-local function stops_until(p, stops, cur, i)
-  local k = (i - cur) % #stops
-  if p.space_location and p.space_location.name == stops[cur] then return k end
-  return k + 1
+---------------------------------------------------------------- learning how long ships really take
+
+local function stats_of(p)
+  local st = storage.stats[p.index]
+  if not st then st = { dwell = {}, leg = {} }; storage.stats[p.index] = st end
+  return st
 end
 
--- ships in automatic mode that have `here` in their schedule
+-- running average (recent runs count more), number of samples and maximum
+local function learn(t, v)
+  if not t.n or t.n == 0 then t.avg, t.n, t.max = v, 1, v
+  else t.avg = t.avg + (v - t.avg) * 0.3; t.n = t.n + 1; t.max = math.max(t.max or v, v) end
+end
+
+local function rec_key(i, station) return i .. ":" .. tostring(station) end
+local function leg_key(a, b) return a .. "\0" .. b end
+
+local STATE = defines.space_platform_state
+
+-- called whenever a ship changes state: measures how long it stays at each stop and how long each flight takes
+-- (stops where the ship was paused, by Space Taxi or by hand, are not counted)
+local function observe(p)
+  if not (p and p.valid) then return end
+  local st = stats_of(p)
+  local state = p.state
+  local loc = p.space_location and p.space_location.name
+  if state == STATE.paused then
+    if st.at_tick then st.tainted = true else st.left_tick = nil end
+  elseif state == STATE.waiting_at_station or state == STATE.waiting_for_departure then
+    if st.at_tick and st.at_name == loc then return end -- the same visit (e.g. unpaused again)
+    local s = p.schedule
+    if not (s and loc) then return end
+    if st.left_tick and st.left_from and st.left_from ~= loc then
+      local ticks = game.tick - st.left_tick
+      local k = leg_key(st.left_from, loc)
+      st.leg[k] = st.leg[k] or {}
+      learn(st.leg[k], ticks)
+      local km = distance(st.left_from, loc)
+      if ticks > 0 and km > 0 and km < 1e8 then
+        local v = km / ticks
+        st.kmpt = st.kmpt and (st.kmpt + (v - st.kmpt) * 0.3) or v
+      end
+    end
+    st.at_tick, st.at_name, st.at_key, st.tainted = game.tick, loc, rec_key(s.current, loc), false
+    st.left_tick, st.left_from = nil, nil
+  elseif state == STATE.on_the_path or state == STATE.no_path then
+    -- the wait conditions are done (with no path the ship is stuck, but its stop is over)
+    if st.at_tick then
+      if not st.tainted then
+        st.dwell[st.at_key] = st.dwell[st.at_key] or {}
+        learn(st.dwell[st.at_key], game.tick - st.at_tick)
+      end
+      st.left_from, st.left_tick = st.at_name, game.tick
+      st.at_tick, st.at_name, st.at_key = nil, nil, nil
+    end
+  end
+end
+
+---------------------------------------------------------------- estimating arrival times
+
+-- what a stop's wait conditions guarantee:
+--   "none" (leaves at once), "fixed" (only time conditions), "capped" (one OR branch is only a time), "open" (could be forever)
+-- returns kind, upper bound in ticks (nil for "open")
+local function wait_info(rec)
+  local wc = rec and rec.wait_conditions
+  if not wc or #wc == 0 then return "none", 0 end
+  local bound, all_timed, group = nil, true, nil
+  local function close(g)
+    if not g then return end
+    if g.timed then bound = math.min(bound or g.t, g.t) else all_timed = false end
+  end
+  for i, c in ipairs(wc) do
+    if i == 1 or c.compare_type == "or" then close(group); group = { t = 0, timed = true } end
+    if c.type == "time" then group.t = math.max(group.t, c.ticks or 0) else group.timed = false end
+  end
+  close(group)
+  if all_timed then return "fixed", bound end
+  if bound then return "capped", bound end
+  return "open", nil
+end
+
+-- expected wait at record i: what was observed there, else what the conditions say
+-- returns ticks, unsure (an "open" stop never observed)
+local function est_wait(st, i, rec)
+  local d = st.dwell[rec_key(i, rec.station)]
+  if d and d.n and d.n > 0 then return d.avg, false end
+  local kind, bound = wait_info(rec)
+  if kind == "open" then return UNKNOWN_WAIT, true end
+  return bound or 0, false
+end
+
+local function km_per_tick(st)
+  return (st.kmpt and st.kmpt > 0) and st.kmpt or DEFAULT_KM_PER_TICK
+end
+
+local function est_travel(st, a, b)
+  if not (a and b) or a == b then return 0 end
+  local leg = st.leg[leg_key(a, b)]
+  if leg and leg.n and leg.n > 0 then return leg.avg end
+  return distance(a, b) / km_per_tick(st)
+end
+
+-- flight time left to `target` for a ship in flight
+local function remaining_travel(p, st, target)
+  if st.left_from and st.left_tick then
+    local leg = st.leg[leg_key(st.left_from, target)]
+    if leg and leg.n and leg.n > 0 then return math.max(0, leg.avg - (game.tick - st.left_tick)) end
+  end
+  local c = p.space_connection
+  if c and p.distance then
+    local len, d = c.length, p.distance
+    local to_end = (1 - d) * len + distance(c.to.name, target)
+    local to_start = d * len + distance(c.from.name, target)
+    local last = p.last_visited_space_location
+    local km
+    if last and last.name == c.from.name then km = to_end
+    elseif last and last.name == c.to.name then km = to_start
+    else km = math.min(to_end, to_start) end
+    return km / km_per_tick(st)
+  end
+  local from = st.left_from or (p.last_visited_space_location and p.last_visited_space_location.name)
+  return est_travel(st, from, target)
+end
+
+-- the ship's next visits in order: {i, station, arrive, leave, unsure}, times in ticks from now
+local function timeline(p, count)
+  local s = p.schedule
+  local out = {}
+  if not (s and s.records and #s.records > 0) then return out end
+  local recs, n, cur = s.records, #s.records, s.current or 1
+  local st = stats_of(p)
+  local first = recs[cur]
+  local loc = p.space_location and p.space_location.name
+  local arrive, w, unsure
+  w, unsure = est_wait(st, cur, first)
+  if loc and loc == first.station then
+    arrive = 0
+    if st.at_tick and st.at_name == loc then w = math.max(0, w - (game.tick - st.at_tick)) end
+  else
+    arrive = first.station and remaining_travel(p, st, first.station) or 0
+  end
+  -- unsure: this stop's own wait is a guess; u: the arrival here depends on such a guess
+  local prev = { i = cur, station = first.station, arrive = arrive, leave = arrive + w, unsure = unsure, u = false, here = loc == first.station }
+  out[1] = prev
+  for k = 1, count - 1 do
+    local j = (cur - 1 + k) % n + 1
+    local r = recs[j]
+    local a = prev.leave + est_travel(st, prev.station, r.station)
+    local ww, u = est_wait(st, j, r)
+    prev = { i = j, station = r.station, arrive = a, leave = a + ww, unsure = u, u = prev.u or prev.unsure }
+    out[#out + 1] = prev
+  end
+  return out
+end
+
+-- a ride on ship p from `here` (to `dest`, if given)
+-- returns {platform, pickup, arrive, unsure, hops, stops} or nil; `skip_now` ignores a visit going on right now
+local function trip(p, here, dest, skip_now)
+  local s = p.schedule
+  if not (s and s.records and #s.records > 0) then return nil end
+  local n = #s.records
+  local tl = timeline(p, 2 * n + 1)
+  local at0 = tl[1] and tl[1].here
+  for k = 1, n + 1 do
+    local v = tl[k]
+    if v and v.station == here and not (k == 1 and at0 and skip_now) then
+      local stops = at0 and k - 1 or k
+      if not dest then return { platform = p, pickup = v.arrive, stops = stops, unsure = v.u } end
+      -- after boarding, the ship waits at `here` again (its wait restarts when Space Taxi lets it go)
+      local full = est_wait(stats_of(p), v.i, s.records[v.i])
+      local shift = (v.arrive + BOARD_TICKS + full) - v.leave
+      for m = k + 1, #tl do
+        local w = tl[m]
+        if w.station == dest then
+          return { platform = p, pickup = v.arrive, arrive = w.arrive + shift, unsure = w.u, hops = m - k, stops = stops }
+        end
+      end
+      return nil
+    end
+  end
+  return nil
+end
+
+local function faster(a, b)
+  if not b then return true end
+  if math.abs(a.arrive - b.arrive) > 60 then return a.arrive < b.arrive end
+  if a.hops ~= b.hops then return a.hops < b.hops end
+  return a.pickup < b.pickup
+end
+
+-- ships in automatic mode that have `here` in their schedule, soonest first
 local function ships_stopping_at(force, here)
   local out = {}
   for _, p in pairs(force.platforms) do
     if is_auto(p) then
-      local stops, cur = stops_of(p)
-      local best
-      for i, s in ipairs(stops) do
-        if s == here then
-          local n = stops_until(p, stops, cur, i)
-          if not best or n < best then best = n end
-        end
+      local t = trip(p, here, nil)
+      if t then
+        t.at_here = t.stops == 0
+        table.insert(out, t)
       end
-      if best then table.insert(out, { platform = p, stops = best, at_here = p.space_location and p.space_location.name == here }) end
     end
   end
-  table.sort(out, function(a, b) if a.stops ~= b.stops then return a.stops < b.stops end return a.platform.index < b.platform.index end)
+  table.sort(out, function(a, b) if a.pickup ~= b.pickup then return a.pickup < b.pickup end return a.platform.index < b.platform.index end)
   return out
 end
 
--- the most direct passenger ship from `here` to `dest`
--- returns {platform, km, hops, stops} or nil
+-- the passenger ship that gets you from `here` to `dest` soonest
 local function best_ship(force, here, dest)
   local best
   for _, p in pairs(force.platforms) do
     if is_auto(p) and accepts_passengers(p) then
-      local stops, cur = stops_of(p)
-      local n = #stops
-      for i, s in ipairs(stops) do
-        if s == here then
-          local km, hops, prev = 0, 0, here
-          for k = 1, n - 1 do
-            local j = (i - 1 + k) % n + 1
-            local t = stops[j]
-            if t then
-              km = km + distance(prev, t); hops = hops + 1; prev = t
-              if t == dest then
-                local c = { platform = p, km = km, hops = hops, stops = stops_until(p, stops, cur, i) }
-                if not best or c.km < best.km - 1e-6 or (math.abs(c.km - best.km) <= 1e-6 and (c.hops < best.hops or (c.hops == best.hops and c.stops < best.stops))) then best = c end
-                break
-              end
-            end
-          end
-        end
-      end
+      local t = trip(p, here, dest)
+      if t and faster(t, best) then best = t end
     end
   end
   return best
@@ -160,8 +351,14 @@ local function destinations(force, here)
     local b = best_ship(force, here, name)
     if b then table.insert(out, { name = name, ship = b }) end
   end
-  table.sort(out, function(a, b) return a.ship.km < b.ship.km end)
+  table.sort(out, function(a, b) return a.ship.arrive < b.ship.arrive end)
   return out
+end
+
+local function fmt_ticks(t)
+  local s = math.floor(t / 60 + 0.5)
+  if s >= 3600 then return string.format("%d:%02d:%02d", math.floor(s / 3600), math.floor(s % 3600 / 60), s % 60) end
+  return string.format("%d:%02d", math.floor(s / 60), s % 60)
 end
 
 ---------------------------------------------------------------- holding a ship
@@ -207,12 +404,27 @@ local function update_status(player)
     text = { "space-taxi.status-no-rocket", name }
   elseif b.stage == "seated" then
     text = b.to and { "space-taxi.status-waiting-dest", name, loc_label(b.to), where } or { "space-taxi.status-waiting", name, where }
-  elseif b.stage == "launched" then text = { "space-taxi.status-launched", name }
+  elseif b.stage == "launched" or b.stage == "docking" then text = { "space-taxi.status-launched", name }
   elseif b.stage == "aboard" then text = { "space-taxi.status-aboard", name, loc_label(b.to) }
   else text = { "space-taxi.status-landing", loc_label(b.to or "nauvis") } end
+  local eta, unsure
+  if b.platform.valid then
+    if b.stage == "seating" or b.stage == "seated" then
+      local t = trip(b.platform, b.from, nil, b.missed)
+      if t and t.pickup > 0 then eta, unsure = t.pickup, t.unsure end
+    elseif b.stage == "aboard" then
+      for _, v in ipairs(timeline(b.platform, #(b.platform.schedule and b.platform.schedule.records or {}) + 1)) do
+        if v.station == b.to then
+          if v.arrive > 0 then eta, unsure = v.arrive, v.u end
+          break
+        end
+      end
+    end
+  end
+  if eta then text = { "", text, "  [color=0.7,0.7,0.7]~" .. fmt_ticks(eta) .. (unsure and " ?" or "") .. "[/color]" } end
   if b.note then text = { "", text, "  [color=1,0.6,0.3]", { "space-taxi." .. b.note }, "[/color]" } end
-  f.add { type = "label", caption = text }
-  if b.stage ~= "launched" and b.stage ~= "landing" then
+  f.add { type = "label", caption = text, tooltip = unsure and { "space-taxi.unsure-tip" } or nil }
+  if b.stage ~= "launched" and b.stage ~= "docking" and b.stage ~= "landing" then
     local c = f.add { type = "sprite-button", sprite = "utility/close", style = "tool_button_red", tooltip = { "space-taxi.cancel" }, tags = { space_taxi = "cancel" } }
     c.style.size = 24
   end
@@ -289,10 +501,14 @@ end
 local function launch(player, b)
   local p, silo = b.platform, b.silo
   hold(p, player.index) -- keep the ship here while the rocket flies (about 35 s)
+  if not (silo and silo.valid) or b.stage ~= "seated" then return end -- pausing the ship can run step_booking again
   silo.disabled_by_script = false
   -- regular deliveries to a platform go to its hub as a "station"
   local ok = silo.launch_rocket({ type = defines.cargo_destination.station, station = p.hub }, player.character)
-  if not ok then silo.disabled_by_script = true; return end
+  if not ok then
+    if silo.rocket_silo_status == defines.rocket_silo_status.rocket_ready then silo.disabled_by_script = true end
+    return
+  end
   if not is_in(b.pod, player, player.character) then pcall(b.pod.set_passenger, player.character) end
   storage.silos[silo.unit_number] = nil
   b.silo, b.pod = nil, nil
@@ -311,6 +527,19 @@ local function try_land(player, b)
   end
 end
 
+-- a destination booking is not tied to one ship: until the rocket launches, it moves to whichever ship
+-- gets there clearly sooner, or to a passenger ship that is in orbit right now and is no slower
+local function rebook(player, b)
+  local p = b.platform
+  if p.valid and ship_here(p, b.from) and not b.missed then return end -- the booked ship is here: board it
+  local best = best_ship(player.force, b.from, b.to)
+  if not best or best.platform == p then return end
+  local cur = p.valid and is_auto(p) and accepts_passengers(p) and trip(p, b.from, b.to, b.missed)
+  if cur and best.arrive > cur.arrive - SWITCH_MARGIN and not ship_here(best.platform, b.from) then return end
+  if p.valid then release(p.index, player.index) end
+  b.platform, b.missed = best.platform, nil
+end
+
 local function book(player, p, to)
   local here = here_of(player)
   if not here then return end
@@ -318,14 +547,46 @@ local function book(player, p, to)
   local b = { platform = p, from = here, to = to, stage = "seating", since = game.tick }
   storage.bookings[player.index] = b
   seat(player, b)
-  if b.stage == "seated" and ship_here(p, here) then launch(player, b) end
+  if b.stage == "seated" and ship_here(p, here) then
+    busy[player.index] = true
+    launch(player, b)
+    busy[player.index] = nil
+  end
   update_status(player)
 end
 
-local function step_booking(player_index)
+local function arrived_on_ship(player, b)
+  free_silo(b)
+  if player.cargo_pod and player.cargo_pod.valid then
+    -- on the ship's surface, but the pod is still coming down onto the hub: keep holding the ship
+    b.stage, b.note = "docking", nil
+    update_status(player)
+    return
+  end
+  release(b.platform.index, player.index)
+  if b.to then
+    b.stage, b.note = "aboard", nil
+    try_land(player, b)
+  else
+    storage.bookings[player.index] = nil
+  end
+  update_status(player)
+end
+
+local function step_booking_now(player_index)
   local b = storage.bookings[player_index]
   local player = game.get_player(player_index)
   if not b then return end
+  if (b.stage == "launched" or b.stage == "docking") and player and player.valid and b.platform.valid and player.physical_surface == b.platform.surface then
+    arrived_on_ship(player, b)
+    return
+  end
+  -- the rocket never left (e.g. the launch was interrupted): sit down again and wait for the ship
+  if b.stage == "launched" and player and player.valid and game.tick - (b.since or 0) > 90 * 60
+    and b.platform.valid and player.physical_surface ~= b.platform.surface and here_of(player) == b.from then
+    b.stage, b.note = "seating", nil
+  end
+  if player and player.valid and b.to and (b.stage == "seating" or b.stage == "seated") then rebook(player, b) end
   if not (player and player.valid) or not b.platform.valid then
     free_silo(b)
     if b.platform.valid then release(b.platform.index, player_index) end
@@ -348,7 +609,15 @@ local function step_booking(player_index)
   update_status(player)
 end
 
+local function step_booking(player_index)
+  if busy[player_index] then return end
+  busy[player_index] = true
+  step_booking_now(player_index)
+  busy[player_index] = nil
+end
+
 script.on_event(defines.events.on_space_platform_changed_state, function(e)
+  observe(e.platform)
   for pi, b in pairs(storage.bookings) do
     if b.platform == e.platform then step_booking(pi) end
   end
@@ -361,15 +630,7 @@ script.on_event(defines.events.on_player_changed_surface, function(e)
   if not b.platform.valid then step_booking(e.player_index); return end
   local surface = player.physical_surface
   if surface == b.platform.surface and b.stage ~= "aboard" and b.stage ~= "landing" then
-    free_silo(b)
-    release(b.platform.index, e.player_index)
-    if b.to then
-      b.stage, b.note = "aboard", nil
-      try_land(player, b)
-    else
-      storage.bookings[e.player_index] = nil
-    end
-    update_status(player)
+    arrived_on_ship(player, b)
   elseif surface ~= b.platform.surface and b.stage == "landing" then
     release(b.platform.index, e.player_index)
     storage.bookings[e.player_index] = nil
@@ -377,11 +638,24 @@ script.on_event(defines.events.on_player_changed_surface, function(e)
   end
 end)
 
+-- the passenger's pod has come down on the ship's hub (or a planet): continue at once
+script.on_event(defines.events.on_cargo_pod_finished_descending, function(e)
+  if e.player_index and storage.bookings[e.player_index] then step_booking(e.player_index) end
+end)
+
 script.on_nth_tick(60, function()
   for pi in pairs(storage.bookings) do step_booking(pi) end
   for idx, h in pairs(storage.holds) do
     if not h.platform.valid then storage.holds[idx] = nil
     elseif game.tick >= h.until_tick then
+      local flying = false -- never let the ship go while a passenger's rocket is on its way to it
+      for pi in pairs(h.players) do
+        local b = storage.bookings[pi]
+        if b and (b.stage == "launched" or b.stage == "docking") then flying = true end
+      end
+      if flying then h.until_tick = game.tick + 60 * 30 end
+    end
+    if h.platform.valid and game.tick >= h.until_tick then
       for pi in pairs(h.players) do
         local b = storage.bookings[pi]
         if b and b.stage == "seating" then b.missed = true end -- no rocket in time: wait for the next visit
@@ -398,10 +672,11 @@ local function close_window(player)
   if player.gui.screen[WINDOW] then player.gui.screen[WINDOW].destroy() end
 end
 
-local function add_row(tbl, sprite_name, caption, info, button_caption, tags)
+local function add_row(tbl, sprite_name, caption, info, button_caption, tags, unsure)
   local l = tbl.add { type = "label", caption = caption }
   l.style.minimal_width = 160
-  local i = tbl.add { type = "label", caption = info }
+  if unsure then info = { "", info, " [color=1,0.6,0.3]?[/color]" } end
+  local i = tbl.add { type = "label", caption = info, tooltip = unsure and { "space-taxi.unsure-tip" } or nil }
   i.style.font_color = { 0.75, 0.75, 0.75 }
   tbl.add { type = "button", caption = button_caption, tags = tags, style = "green_button" }
 end
@@ -438,8 +713,8 @@ local function open_window(player)
       t.style.vertical_align = "center"; t.style.horizontal_spacing = 12
       for _, d in ipairs(dests) do
         add_row(t, nil, loc_label(d.name),
-          { "space-taxi.via", d.ship.platform.name, d.ship.hops, string.format("%.0f", d.ship.km), stops_text(d.ship.stops) },
-          { "space-taxi.go" }, { space_taxi = "dest", dest = d.name })
+          { "space-taxi.via", d.ship.platform.name, "~" .. fmt_ticks(d.ship.arrive), stops_text(d.ship.stops) },
+          { "space-taxi.go" }, { space_taxi = "dest", dest = d.name }, d.ship.unsure)
       end
     end
     inner.add { type = "line" }
@@ -450,8 +725,10 @@ local function open_window(player)
       local t = inner.add { type = "table", column_count = 3 }
       t.style.horizontal_spacing = 12
       for _, s in ipairs(ships) do
-        add_row(t, nil, s.platform.name, stops_text(s.stops, s.at_here), { "space-taxi.wait" },
-          { space_taxi = "ship", platform = s.platform.index })
+        local info = stops_text(s.stops, s.at_here)
+        if not s.at_here then info = { "", info, " · ~" .. fmt_ticks(s.pickup) } end
+        add_row(t, nil, s.platform.name, info, { "space-taxi.wait" },
+          { space_taxi = "ship", platform = s.platform.index }, not s.at_here and s.unsure)
       end
     end
   end
@@ -531,17 +808,23 @@ end)
 remote.add_interface("space-taxi", {
   best_ship = function(force, here, dest)
     local b = best_ship(game.forces[force], here, dest)
-    return b and { name = b.platform.name, km = b.km, hops = b.hops, stops = b.stops } or nil
+    return b and { name = b.platform.name, arrive = b.arrive, pickup = b.pickup, unsure = b.unsure, hops = b.hops, stops = b.stops } or nil
   end,
   ships_stopping_at = function(force, here)
     local out = {}
-    for _, s in ipairs(ships_stopping_at(game.forces[force], here)) do table.insert(out, { name = s.platform.name, stops = s.stops }) end
+    for _, s in ipairs(ships_stopping_at(game.forces[force], here)) do table.insert(out, { name = s.platform.name, stops = s.stops, pickup = s.pickup, unsure = s.unsure }) end
     return out
   end,
   destinations = function(force, here)
     local out = {}
-    for _, d in ipairs(destinations(game.forces[force], here)) do table.insert(out, { name = d.name, ship = d.ship.platform.name, km = d.ship.km }) end
+    for _, d in ipairs(destinations(game.forces[force], here)) do table.insert(out, { name = d.name, ship = d.ship.platform.name, arrive = d.ship.arrive }) end
     return out
+  end,
+  wait_info = function(rec) return { wait_info(rec) } end,
+  stats = function(idx) return storage.stats[idx] end,
+  booking = function(pi)
+    local b = storage.bookings[pi]
+    return b and { ship = b.platform.valid and b.platform.name, stage = b.stage, to = b.to } or nil
   end,
   set_passengers = function(idx, v) storage.passengers[idx] = v end,
 })

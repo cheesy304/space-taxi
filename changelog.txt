@@ -1,4 +1,26 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.3.2
+Date: 2026-11-20
+  Bugfixes:
+    - The ship now waits until your pod has landed on its hub. Before, it left as soon as you reached orbit, so it looked like it flew off without you.
+    - A ship is never let go by the time limit while a passenger's rocket is on its way to it.
+---------------------------------------------------------------------------------------------------
+Version: 0.3.1
+Date: 2026-11-20
+  Bugfixes:
+    - Fixed the rocket not launching when the ship arrived: pausing the ship started the launch a second time, which switched the silo off again.
+    - Silos left switched off by this bug are switched back on, and a booking stuck as "launched" puts you back in a rocket.
+    - A passenger who reached the ship is now always noticed, even if the surface change was missed.
+---------------------------------------------------------------------------------------------------
+Version: 0.3.0
+Date: 2026-11-20
+  Features:
+    - Ships are now ranked by estimated arrival time instead of distance. Space Taxi reads each stop's wait conditions (fixed time, time-capped, or open-ended such as "wait for items") and learns how long every ship really stays at each stop and how long each flight takes.
+    - Destination bookings are no longer tied to one ship: until your rocket launches, Space Taxi switches to a ship that gets you there clearly sooner, or to a passenger ship that is in orbit right now and is no slower.
+    - The travel window and the status line show the estimated time. A "?" marks a guess, when the route has an open-ended stop that has not been observed yet.
+  Changes:
+    - A ship paused by Space Taxi while a passenger boards still counts as being in automatic mode.
+---------------------------------------------------------------------------------------------------
 Version: 0.2.2
 Date: 2026-11-20
   Graphics:

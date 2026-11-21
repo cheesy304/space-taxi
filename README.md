@@ -8,14 +8,20 @@ Built for setups where ships run fixed routes and only stop for a few seconds at
 
 ### Wait for a ship
 - Lists every platform in **automatic mode** that has your current planet in its schedule, even if it is far away.
-- Shows when it arrives: *in orbit now*, *next stop*, *stop no. 3*, …
+- Shows when it arrives: *in orbit now*, *next stop · ~0:45*, *stop no. 3 · ~4:10*, …
 - Click **Wait** and you are seated in the rocket of the nearest silo with a rocket ready.
 - When the ship arrives, the rocket launches automatically.
 
 ### Fly to a planet
 - Lists every planet you can reach from here with a passenger ship.
-- Picks the **most direct ship**: the shortest route (in km along its schedule) from your planet to the destination. Ties go to fewer stops, then to the ship that arrives soonest.
+- Picks the ship that gets you there **soonest**, counting the time until it reaches your planet, the flights, and the waits at every stop on the way.
+- Until your rocket launches, the booking is not tied to one ship: if another ship turns out to be clearly faster, or a passenger ship is in orbit right now and is no slower, Space Taxi switches to it.
 - When the ship reaches the destination, you **land automatically**, just like pressing *Land on planet*.
+
+### Arrival times that learn
+- Space Taxi reads each stop's **wait conditions**: a fixed time is known exactly, and a condition like *items full OR 30 s* waits at most 30 s.
+- Stops that could wait forever (e.g. *wait for items*) are estimated from what the ship actually did: Space Taxi **learns** how long every ship stays at each stop and how long each flight takes.
+- Until a ship has been seen at such a stop, its time is a guess and is marked with an orange **?**.
 
 ### Never miss the window
 - The rocket flight takes about 35 seconds, longer than a short stop. When your ship arrives, Space Taxi **pauses it** until you are aboard (or have landed), then switches it back to automatic mode.
